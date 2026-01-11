@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+data/qa_raw.json
+data/qa_index.json
+*.log
+.DS_Store
+
+
