@@ -96,13 +96,35 @@ async function fetchCSV(url: string): Promise<string> {
  * CSVをパース
  */
 function parseCSV(csvContent: string): Record<string, string | undefined>[] {
-  const result = parse<Record<string, string | undefined>>(csvContent, {
+  // BOM（Byte Order Mark）を削除
+  let content = csvContent;
+  if (content.charCodeAt(0) === 0xfeff) {
+    content = content.slice(1);
+  }
+  
+  const result = parse<Record<string, string | undefined>>(content, {
     header: true,
     skipEmptyLines: true,
+    transformHeader: (header: string) => {
+      // ヘッダー名の前後の空白やBOMを削除
+      return header.trim().replace(/^\uFEFF/, '');
+    },
+    transform: (value: string) => {
+      // 値の前後の空白を削除（ただし空文字列はそのまま）
+      return value === '' ? value : value.trim();
+    },
   });
 
   if (result.errors.length > 0) {
-    console.warn('CSV parse warnings:', result.errors);
+    console.warn('CSV parse warnings:', result.errors.slice(0, 10)); // 最初の10件のみ表示
+    if (result.errors.length > 10) {
+      console.warn(`... and ${result.errors.length - 10} more errors`);
+    }
+  }
+
+  console.log(`Parsed ${result.data.length} rows from CSV`);
+  if (result.data.length > 0) {
+    console.log(`Sample columns:`, Object.keys(result.data[0]));
   }
 
   return result.data;

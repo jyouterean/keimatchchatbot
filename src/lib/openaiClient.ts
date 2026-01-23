@@ -16,3 +16,5 @@ export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-
 export const CHAT_MODEL = process.env.CHAT_MODEL || 'gpt-4o-mini';
 
 
+
+

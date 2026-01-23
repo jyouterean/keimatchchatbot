@@ -1,5 +1,6 @@
 import { Client, middleware, WebhookEvent, TextMessage } from '@line/bot-sdk';
 import { generateAnswer } from './qaAnswer';
+import { getHandoffRecord, isHandoffEnabled, setHandoffEnabled } from './handoffStore';
 
 const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 if (!channelAccessToken) {
@@ -19,10 +20,16 @@ export const lineClient = new Client({
 const staffChannelAccessToken = process.env.STAFF_LINE_CHANNEL_ACCESS_TOKEN;
 const staffTargetId = process.env.STAFF_TARGET_ID;
 
-const staffClient =
-  staffChannelAccessToken && staffTargetId
-    ? new Client({ channelAccessToken: staffChannelAccessToken })
-    : null;
+// スタッフBot（別チャネル）のWebhook応答に使うクライアント（tokenがあれば作成）
+export const staffWebhookClient = staffChannelAccessToken
+  ? new Client({ channelAccessToken: staffChannelAccessToken })
+  : null;
+
+// スタッフBotのWebhook（ボタンのpostbackを受け取るため）
+const staffChannelSecret = process.env.STAFF_LINE_CHANNEL_SECRET;
+export const staffLineMiddleware = staffChannelSecret
+  ? middleware({ channelSecret: staffChannelSecret })
+  : null;
 
 const channelSecret = process.env.LINE_CHANNEL_SECRET;
 if (!channelSecret) {
@@ -39,11 +46,99 @@ export const lineMiddleware = middleware({
  */
 const messageHistory = new Map<string, string[]>();
 
+function isReleaseCommand(text: string): boolean {
+  const t = text.trim();
+  return (
+    t === '解除' ||
+    t === '担当者解除' ||
+    t === '担当者終了' ||
+    t === '再開' ||
+    t === 'bot再開' ||
+    t === 'Bot再開' ||
+    t === 'BOT再開'
+  );
+}
+
+function buildHandoffFlex(params: {
+  userId: string;
+  displayName: string;
+  currentText: string;
+  previousText?: string;
+}): any {
+  const record = getHandoffRecord(params.userId);
+  const status = record?.enabled ? 'ON（Bot停止中）' : 'OFF（Bot稼働）';
+
+  return {
+    type: 'flex',
+    altText: `担当者対応: ${params.displayName}（${status}）`,
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          { type: 'text', text: '担当者対応', weight: 'bold', size: 'lg' },
+          { type: 'text', text: `状態: ${status}`, size: 'sm', color: '#666666' },
+          { type: 'text', text: `ユーザー: ${params.displayName}`, size: 'sm', wrap: true },
+          { type: 'text', text: `userId: ${params.userId}`, size: 'xs', color: '#999999', wrap: true },
+        ],
+        paddingAll: '12px',
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'md',
+        contents: [
+          ...(params.previousText
+            ? [
+                { type: 'text', text: '一つ前', size: 'sm', color: '#666666' },
+                { type: 'text', text: params.previousText, wrap: true, size: 'sm' },
+              ]
+            : []),
+          { type: 'text', text: '今回', size: 'sm', color: '#666666' },
+          { type: 'text', text: params.currentText, wrap: true, size: 'md' },
+        ],
+        paddingAll: '12px',
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            color: '#D0021B',
+            action: {
+              type: 'postback',
+              label: 'Bot停止（このユーザー）',
+              data: `handoff:on:${params.userId}`,
+              displayText: 'Bot停止（このユーザー）',
+            },
+          },
+          {
+            type: 'button',
+            style: 'secondary',
+            action: {
+              type: 'postback',
+              label: 'Bot再開（このユーザー）',
+              data: `handoff:off:${params.userId}`,
+              displayText: 'Bot再開（このユーザー）',
+            },
+          },
+        ],
+        paddingAll: '12px',
+      },
+    },
+  };
+}
+
 /**
  * 担当者用トークに通知を送信
  */
 async function notifyStaff(event: WebhookEvent & { message: TextMessage }, previousMessage?: string) {
-  if (!staffClient || !staffTargetId) {
+  if (!staffWebhookClient || !staffTargetId) {
     console.warn('Staff notification is not configured (STAFF_LINE_CHANNEL_ACCESS_TOKEN / STAFF_TARGET_ID).');
     return;
   }
@@ -66,26 +161,22 @@ async function notifyStaff(event: WebhookEvent & { message: TextMessage }, previ
 
   const text = event.message.text || '';
 
-  // 一つ前のメッセージがある場合は含める
-  let notifyText = `対応が必要なメッセージが届きました。
-
-送信ユーザー: ${displayName}`;
-
-  if (previousMessage) {
-    notifyText += `
-
-一つ前のメッセージ:
-${previousMessage}`;
+  // ボタン付き通知（postbackでON/OFFを切り替える）
+  if (userId) {
+    const flex = buildHandoffFlex({
+      userId,
+      displayName,
+      currentText: text,
+      previousText: previousMessage,
+    });
+    await staffWebhookClient.pushMessage(staffTargetId, flex);
+    return;
   }
 
-  notifyText += `
-
-今回のメッセージ:
-${text}`;
-
-  await staffClient.pushMessage(staffTargetId, {
+  // userIdが取得できない場合はテキスト通知のみ
+  await staffWebhookClient.pushMessage(staffTargetId, {
     type: 'text',
-    text: notifyText,
+    text: `対応が必要なメッセージが届きました。\n\n送信ユーザー: ${displayName}\n\n今回のメッセージ:\n${text}`,
   });
 }
 
@@ -141,8 +232,49 @@ function splitLongMessage(text: string, maxLength: number): string[] {
 /**
  * LINE Webhookイベントを処理
  */
-export async function handleLineWebhook(events: WebhookEvent[]): Promise<void> {
+export async function handleLineWebhook(
+  events: WebhookEvent[],
+  opts?: { replyClient?: Client | null }
+): Promise<void> {
+  // postback返信に使うクライアント（デフォルトはメインBot）
+  const replyClient = opts?.replyClient ?? lineClient;
   for (const event of events) {
+    // スタッフグループのpostbackでhandoffを切り替え
+    if (event.type === 'postback') {
+      const source: any = (event as any).source || {};
+      const groupId: string | undefined = source.groupId;
+      const data: string = (event as any).postback?.data || '';
+
+      // 通知先グループからのpostbackだけを受理
+      if (staffTargetId && groupId && groupId === staffTargetId && (data.startsWith('handoff:on:') || data.startsWith('handoff:off:'))) {
+        const parts = data.split(':');
+        const action = parts[1]; // on/off
+        const userId = parts.slice(2).join(':');
+        if (userId) {
+          const enabled = action === 'on';
+          setHandoffEnabled({
+            userId,
+            enabled,
+            updatedBy: groupId,
+            reason: 'staff_group_postback',
+          });
+
+          // グループに結果を返信（このイベントが発生したBotのチャネルで返信）
+          if (replyClient) {
+            try {
+              await replyClient.replyMessage((event as any).replyToken, {
+                type: 'text',
+                text: `handoffを更新しました: ${enabled ? 'ON（Bot停止）' : 'OFF（Bot再開）'}\nuserId: ${userId}`,
+              });
+            } catch (e) {
+              console.warn('Failed to reply handoff update to group:', e);
+            }
+          }
+        }
+      }
+      continue;
+    }
+
     if (event.type !== 'message' || event.message.type !== 'text') {
       continue;
     }
@@ -162,6 +294,15 @@ export async function handleLineWebhook(events: WebhookEvent[]): Promise<void> {
     try {
       // 「担当者」が送られてきた場合の特別対応
       if (incomingText === '担当者') {
+        if (userId) {
+          setHandoffEnabled({
+            userId,
+            enabled: true,
+            updatedBy: userId,
+            reason: 'user_requested_staff',
+          });
+        }
+
         // ユーザーへの返信
         await lineClient.replyMessage(textEvent.replyToken, {
           type: 'text',
@@ -180,6 +321,24 @@ export async function handleLineWebhook(events: WebhookEvent[]): Promise<void> {
 
         // 担当者用トークへ通知（設定されている場合のみ）
         await notifyStaff(textEvent, previousMessage);
+        continue;
+      }
+
+      // handoff中はBotが返信しない（解除コマンドのみ受け付け）
+      if (userId && isHandoffEnabled(userId)) {
+        if (isReleaseCommand(incomingText)) {
+          setHandoffEnabled({
+            userId,
+            enabled: false,
+            updatedBy: userId,
+            reason: 'user_released',
+          });
+          await lineClient.replyMessage(textEvent.replyToken, {
+            type: 'text',
+            text: '担当者対応を終了しました。Botの自動回答を再開します。',
+          });
+        }
+        // 解除以外はBot返信しない
         continue;
       }
 
