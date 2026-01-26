@@ -1,7 +1,14 @@
 {
   "Ue543d41090f125f666f85ac51d3d4d6f": {
     "enabled": false,
-    "updatedAt": "2026-01-23T04:17:33.976Z",
+    "updatedAt": "2026-01-23T12:11:04.074Z",
+    "updatedBy": "C29fe856057c6d6ba3159ef83f69ebee7",
+    "reason": "staff_group_postback",
+    "displayName": "上手　伶晏（じょうて　れあん）"
+  },
+  "U721ee3c55ee5b64b7065d444a261881d": {
+    "enabled": false,
+    "updatedAt": "2026-01-23T08:10:48.460Z",
     "updatedBy": "C29fe856057c6d6ba3159ef83f69ebee7",
     "reason": "staff_group_postback"
   }

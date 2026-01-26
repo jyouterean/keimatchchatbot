@@ -6,6 +6,7 @@ type HandoffRecord = {
   updatedAt: string; // ISO
   updatedBy?: string; // groupId/userId etc
   reason?: string;
+  displayName?: string; // last known display name
 };
 
 type HandoffState = Record<string, HandoffRecord>;
@@ -48,13 +49,16 @@ export function setHandoffEnabled(params: {
   enabled: boolean;
   updatedBy?: string;
   reason?: string;
+  displayName?: string;
 }) {
   const state = loadState();
+  const prev = state[params.userId];
   state[params.userId] = {
     enabled: params.enabled,
     updatedAt: new Date().toISOString(),
     updatedBy: params.updatedBy,
     reason: params.reason,
+    displayName: params.displayName ?? prev?.displayName,
   };
   saveState(state);
 }
@@ -63,6 +67,21 @@ export function getHandoffRecord(userId: string | undefined): HandoffRecord | nu
   if (!userId) return null;
   const state = loadState();
   return state[userId] || null;
+}
+
+export function getDisplayName(userId: string | undefined): string | null {
+  if (!userId) return null;
+  const rec = getHandoffRecord(userId);
+  return rec?.displayName || null;
+}
+
+export function listHandoffUsers(): Array<{ userId: string; record: HandoffRecord }> {
+  const state = loadState();
+  return Object.entries(state).map(([userId, record]) => ({ userId, record }));
+}
+
+export function listHandoffEnabledUsers(): Array<{ userId: string; record: HandoffRecord }> {
+  return listHandoffUsers().filter((x) => x.record.enabled);
 }
 
 
