@@ -1,9 +1,45 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+
+# Environment variables (機密情報)
 .env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+
+# Data files (regeneratable or user data)
 data/qa_raw.json
 data/qa_index.json
+data/handoff_state.json
+
+# Backup files
+backups/
+*.backup
+*.bak
+
+# Logs
 *.log
+logs/
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Coverage
+coverage/
+
+# Temporary files
+tmp/
+temp/
 
 

@@ -5,6 +5,7 @@ import { WebhookEvent } from '@line/bot-sdk';
 import { lineMiddleware, staffLineMiddleware, staffWebhookClient, handleLineWebhook } from './lib/lineHandlers';
 import { generateAnswer } from './lib/qaAnswer';
 import { reloadIndex, indexExists } from './lib/indexStore';
+import { log, startTimer } from './lib/logger';
 
 dotenv.config();
 
@@ -49,6 +50,7 @@ app.get('/health', (req: Request, res: Response) => {
  * チャットAPI
  */
 app.post('/chat', async (req: Request, res: Response) => {
+  const timer = startTimer();
   try {
     const { message } = req.body;
 
@@ -59,9 +61,10 @@ app.post('/chat', async (req: Request, res: Response) => {
     }
 
     const response = await generateAnswer(message);
+    log.apiCall('openai', 'chat', { duration: timer(), success: true });
     res.json(response);
   } catch (error) {
-    console.error('Error in /chat:', error);
+    log.error('Error in /chat', error);
     const message = error instanceof Error ? error.message : 'Internal server error';
     res.status(500).json({ error: message });
   }
@@ -82,15 +85,17 @@ app.post('/webhook', async (req: Request, res: Response) => {
       return res.status(200).send('OK');
     }
 
+    log.debug('LINE webhook received', { eventCount: events.length });
+
     // イベント処理（非同期で実行、エラーは内部で処理）
     handleLineWebhook(events).catch((error) => {
-      console.error('Unhandled error in webhook handler:', error);
+      log.error('Unhandled error in webhook handler', error);
     });
 
     // LINEサーバーには即座に200を返す
     res.status(200).send('OK');
   } catch (error) {
-    console.error('Error in /webhook:', error);
+    log.error('Error in /webhook', error);
     // 署名検証エラーなどはミドルウェアが処理済み
     // ここに来る場合は予期しないエラー
     res.status(500).send('Internal server error');
@@ -112,13 +117,15 @@ if (staffLineMiddleware) {
         return res.status(200).send('OK');
       }
 
+      log.debug('Staff webhook received', { eventCount: events.length });
+
       handleLineWebhook(events, { replyClient: staffWebhookClient }).catch((error) => {
-        console.error('Unhandled error in staff webhook handler:', error);
+        log.error('Unhandled error in staff webhook handler', error);
       });
 
       res.status(200).send('OK');
     } catch (error) {
-      console.error('Error in /webhook-staff:', error);
+      log.error('Error in /webhook-staff', error);
       res.status(500).send('Internal server error');
     }
   });
@@ -134,17 +141,21 @@ app.post('/admin/reload', async (req: Request, res: Response) => {
   if (adminToken) {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      log.warn('Admin reload: Authorization required');
       return res.status(401).json({ error: 'Authorization required' });
     }
 
     const token = authHeader.substring(7);
     if (token !== adminToken) {
+      log.warn('Admin reload: Invalid token');
       return res.status(403).json({ error: 'Invalid token' });
     }
   }
 
   try {
+    const timer = startTimer();
     const index = reloadIndex();
+    log.server('reload', { count: index.count, duration: timer() });
     res.json({
       success: true,
       message: 'Index reloaded',
@@ -152,7 +163,7 @@ app.post('/admin/reload', async (req: Request, res: Response) => {
       generatedAt: index.generatedAt,
     });
   } catch (error) {
-    console.error('Error reloading index:', error);
+    log.error('Error reloading index', error);
     const message = error instanceof Error ? error.message : 'Failed to reload index';
     res.status(500).json({ error: message });
   }
@@ -162,36 +173,51 @@ app.post('/admin/reload', async (req: Request, res: Response) => {
  * エラーハンドリング
  */
 app.use((err: Error, req: Request, res: Response, next: express.NextFunction) => {
-  console.error('Unhandled error:', err);
+  log.error('Unhandled error', err, { path: req.path, method: req.method });
   res.status(500).json({ error: 'Internal server error' });
 });
+
+/**
+ * グレースフルシャットダウン
+ */
+function gracefulShutdown(signal: string) {
+  log.server('stop', { signal });
+  server.close(() => {
+    log.info('Server closed');
+    process.exit(0);
+  });
+
+  // 10秒後に強制終了
+  setTimeout(() => {
+    log.warn('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 /**
  * サーバー起動
  */
 const server = app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-  
+  log.server('start', { port: PORT });
+
   // 起動時にインデックスの存在をチェック
   if (indexExists()) {
-    console.log('✓ Q&A index found');
+    log.info('Q&A index found');
   } else {
-    console.warn('⚠ Q&A index not found. Please run "npm run sync" first.');
+    log.warn('Q&A index not found. Please run "npm run sync" first.');
   }
 });
 
 // ポート競合エラーを処理
 server.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`\n❌ Error: Port ${PORT} is already in use.`);
-    console.error(`   Please either:`);
-    console.error(`   1. Stop the other application using port ${PORT}`);
-    console.error(`   2. Set PORT environment variable to a different port (e.g., PORT=3001)`);
-    console.error(`   3. Update your LINE Webhook URL to match the new port\n`);
+    log.error(`Port ${PORT} is already in use`, err);
     process.exit(1);
   } else {
-    console.error('Server error:', err);
+    log.error('Server error', err);
     process.exit(1);
   }
 });
-

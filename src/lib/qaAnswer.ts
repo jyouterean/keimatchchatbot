@@ -1,6 +1,9 @@
 import { openai, CHAT_MODEL, EMBEDDING_MODEL } from './openaiClient';
 import { loadIndex, searchTopK } from './indexStore';
 import { l2Normalize } from './similarity';
+import { withOpenAIRetry } from './retry';
+import { log } from './logger';
+import { sanitizeInput, filterLLMOutput, analyzeInputSafety } from './sanitize';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -33,7 +36,7 @@ function loadKeimatchContext(): string {
       return fs.readFileSync(contextPath, 'utf-8');
     }
   } catch (error) {
-    console.warn('Failed to load keimatch context:', error);
+    log.warn('Failed to load keimatch context', error);
   }
   return '';
 }
@@ -51,6 +54,14 @@ export async function generateAnswer(
     throw new Error('Message is required');
   }
 
+  // 入力のサニタイズとセキュリティチェック
+  const safetyReport = analyzeInputSafety(message);
+  const sanitizedMessage = safetyReport.sanitized;
+
+  if (safetyReport.warnings.length > 0) {
+    log.warn('Input safety warnings', { warnings: safetyReport.warnings });
+  }
+
   // インデックスが存在するかチェック
   try {
     loadIndex();
@@ -60,11 +71,14 @@ export async function generateAnswer(
     );
   }
 
-  // クエリのEmbeddingを生成（現在の質問のみを使用）
-  const queryResponse = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: message.trim(),
-  });
+  // クエリのEmbeddingを生成（サニタイズ済みメッセージを使用、リトライ付き）
+  const queryResponse = await withOpenAIRetry(
+    () => openai.embeddings.create({
+      model: EMBEDDING_MODEL,
+      input: sanitizedMessage,
+    }),
+    'OpenAI Embeddings'
+  );
 
   const queryEmbedding = queryResponse.data[0]?.embedding;
   if (!queryEmbedding) {
@@ -133,7 +147,10 @@ export async function generateAnswer(
   // プロンプトを構築（より構造化された形式）
   let prompt = `あなたは軽マッチのカスタマーサポートアシスタントです。以下の情報を参考に、ユーザーの質問に対して正確で分かりやすい回答を生成してください。
 
-${keimatchContext ? `## 軽マッチの基本情報\n${keimatchContext}\n\n` : ''}${historyContext}${contextQAs ? `## 参考Q&A（類似度の高い順）\n${contextQAs}\n${scoreInfo}` : ''}## ユーザーの質問\n${message}
+${keimatchContext ? `## 軽マッチの基本情報\n${keimatchContext}\n\n` : ''}${historyContext}${contextQAs ? `## 参考Q&A（類似度の高い順）\n${contextQAs}\n${scoreInfo}` : ''}## ユーザーの質問
+<user_input>
+${sanitizedMessage}
+</user_input>
 
 ## 回答生成の指示
 
@@ -162,29 +179,33 @@ ${keimatchContext ? `## 軽マッチの基本情報\n${keimatchContext}\n\n` : '
   const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || '2000', 10);
 
   try {
-    const chatResponse = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'あなたは軽マッチのカスタマーサポートアシスタントです。提供された情報のみを根拠として回答してください。推測や憶測は避け、確実な情報のみを伝えてください。',
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-      temperature: 0.2, // より一貫性のある回答のため温度を下げる
-      max_tokens: MAX_TOKENS,
-    });
+    const chatResponse = await withOpenAIRetry(
+      () => openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'あなたは軽マッチのカスタマーサポートアシスタントです。提供された情報のみを根拠として回答してください。推測や憶測は避け、確実な情報のみを伝えてください。',
+          },
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+        temperature: 0.2, // より一貫性のある回答のため温度を下げる
+        max_tokens: MAX_TOKENS,
+      }),
+      'OpenAI Chat Completion'
+    );
 
     let answer = chatResponse.choices[0]?.message?.content;
     if (!answer) {
       throw new Error('Failed to generate answer from OpenAI');
     }
 
-    answer = answer.trim();
+    // LLM出力のフィルタリング（機密情報漏洩対策）
+    answer = filterLLMOutput(answer.trim());
 
     // 「明確な答えが見つかりません」が含まれている場合、最後に担当者の案内を追加
     if (answer.includes('明確な答えが見つかりません') || answer.includes('答えが見つかりません')) {
@@ -200,7 +221,7 @@ ${keimatchContext ? `## 軽マッチの基本情報\n${keimatchContext}\n\n` : '
     };
   } catch (error) {
     // LLM生成に失敗した場合は、固定メッセージで案内
-    console.error('Error generating RAG answer:', error);
+    log.error('Error generating RAG answer', error);
     const suggestionsText =
       top3.length > 0
         ? top3.map((item, i) => `${i + 1}. ${item.question}`).join('\n')
